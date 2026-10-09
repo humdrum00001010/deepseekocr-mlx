@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
+from itertools import count
 from typing import Any, List, Optional, Protocol, Sequence
 
 import numpy as np
@@ -22,7 +24,7 @@ class TokenizerProtocol(Protocol):
 class GenerationConfig:
     """Configuration controlling the decoding loop."""
 
-    max_new_tokens: int = 512
+    max_new_tokens: int | None = 512
     temperature: float = 0.0
     eos_token_id: Optional[int] = None
     stop_token_ids: Optional[Sequence[int]] = None
@@ -36,6 +38,7 @@ class GenerationResult:
     text: str
     generated_ids: List[int]
     full_ids: List[int]
+    stopped_by_criteria: bool = False
 
 
 def _sample_token(logits: np.ndarray, temperature: float) -> int:
@@ -54,12 +57,20 @@ def generate(
     tokenizer: TokenizerProtocol,
     batch: ProcessorOutput,
     config: Optional[GenerationConfig] = None,
+    *,
+    on_tokens: Callable[[int], None] | None = None,
+    stopping_criteria: Sequence[Callable[..., Any]] = (),
 ) -> GenerationResult:
     """Run a simple greedy/temperature sampling loop for the given batch.
 
     The ``batch`` should be produced by :class:`DeepSeekOCRPreprocessor` and
     contain exactly one prompt/image pair. Image tokens in ``batch`` are
     preserved across steps; only text tokens are appended during decoding.
+    Set ``max_new_tokens=None`` to decode until EOS or a configured stop token.
+    ``on_tokens`` receives zero after prefill and the output count after each
+    sampled token; its exceptions interrupt generation without a partial result.
+    ``stopping_criteria`` receives the full prompt/output IDs and current scores,
+    matching Transformers' callback shape without requiring its model runtime.
     """
 
     if batch.input_ids.shape[0] != 1:
@@ -67,9 +78,15 @@ def generate(
 
     if config is None:
         config = GenerationConfig()
+    if config.max_new_tokens is not None and config.max_new_tokens <= 0:
+        raise ValueError("max_new_tokens must be positive")
     if config.eos_token_id is None:
         eos_id = getattr(getattr(model, "config", None), "eos_token_id", None)
         config.eos_token_id = eos_id
+    if config.max_new_tokens is None and not (
+        config.stop_token_ids or config.eos_token_id is not None
+    ):
+        raise ValueError("Unbounded generation requires an EOS or stop token.")
 
     input_row = np.array(batch.input_ids[0])
     image_mask_row = np.array(batch.images_seq_mask[0])
@@ -80,6 +97,7 @@ def generate(
     images_spatial_crop = batch.images_spatial_crop
 
     generated: List[int] = []
+    stopped_by_criteria = False
 
     base_model = getattr(model, "model", model)
     language_model = getattr(base_model, "language_model", None)
@@ -105,12 +123,22 @@ def generate(
     mx.eval(next_logits)
     next_logits_np = np.array(next_logits)[0]
 
-    for _ in range(config.max_new_tokens):
+    if on_tokens is not None:
+        on_tokens(0)
+    steps = count() if config.max_new_tokens is None else range(config.max_new_tokens)
+    for _ in steps:
         next_token = _sample_token(next_logits_np, config.temperature)
 
         input_ids.append(next_token)
         image_mask.append(False)
         generated.append(next_token)
+        if on_tokens is not None:
+            on_tokens(len(generated))
+
+        if any(criterion(np.array([input_ids]), next_logits_np[None, :])
+               for criterion in stopping_criteria):
+            stopped_by_criteria = True
+            break
 
         if config.stop_token_ids and next_token in config.stop_token_ids:
             break
@@ -129,4 +157,5 @@ def generate(
         generated,
         skip_special_tokens=config.skip_special_tokens,
     )
-    return GenerationResult(text=text, generated_ids=generated, full_ids=input_ids)
+    return GenerationResult(text=text, generated_ids=generated, full_ids=input_ids,
+                            stopped_by_criteria=stopped_by_criteria)

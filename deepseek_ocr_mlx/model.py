@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
 import numpy as np
@@ -1396,3 +1397,54 @@ class DeepSeekOCRForCausalLM(nn.Module):
         )
         # Use the trained lm_head (matches HF behavior)
         return self.lm_head(hidden_states)
+
+    def generate(self, tokenizer, batch, config=None, **kwargs):
+        """Expose the native decoder for Transformers-style inference hooks."""
+        from .generate import generate
+
+        return generate(self, tokenizer, batch, config, **kwargs)
+
+    def infer(
+        self, tokenizer, *, prompt: str, image_file: str | Path,
+        output_path: str | Path | None = None, base_size: int = 1024,
+        image_size: int = 640, crop_mode: bool = True, save_results: bool = False,
+        test_compress: bool = False, eval_mode: bool = True, max_new_tokens: int | None = None,
+    ) -> str:
+        """Run grounded gundam OCR through the Hugging Face ``infer`` interface.
+
+        ``test_compress`` is accepted for compatibility; this port does not print
+        token-compression diagnostics. Saved outputs use their own ``mlx`` folder
+        so the caller's input image and surrounding workspace remain available.
+        """
+        del test_compress
+        if (base_size, image_size, crop_mode) != (1024, 640, True):
+            raise ValueError("MLX OCR inference supports only the gundam size preset")
+        if max_new_tokens is not None and max_new_tokens <= 0:
+            raise ValueError("max_new_tokens must be positive")
+        if save_results and output_path is None:
+            raise ValueError("output_path is required when save_results is enabled")
+        from .generate import GenerationConfig
+        from .postprocess import parse_detections, render_markdown, save_ocr_outputs
+        from .processor import DeepSeekOCRPreprocessor
+
+        with Image.open(image_file) as source_image:
+            image = source_image.convert("RGB")
+        try:
+            batch = DeepSeekOCRPreprocessor(tokenizer, self.config).prepare_single(prompt, [image])
+            result = self.generate(tokenizer, batch, GenerationConfig(
+                max_new_tokens=max_new_tokens, skip_special_tokens=False,
+            ))
+            ended = bool(result.generated_ids) and result.generated_ids[-1] == self.config.eos_token_id
+            if not ended and not result.stopped_by_criteria:
+                raise RuntimeError("MLX OCR generation returned without reaching EOS")
+            text = tokenizer.decode(
+                result.generated_ids[:-1] if ended else result.generated_ids, skip_special_tokens=False,
+            )
+            markdown = None
+            if save_results and output_path is not None and not result.stopped_by_criteria:
+                markdown = save_ocr_outputs(image, text, Path(output_path) / "mlx")
+            if eval_mode:
+                return text
+            return markdown if markdown is not None else render_markdown(text, parse_detections(text), {})
+        finally:
+            image.close()
